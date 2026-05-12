@@ -8,21 +8,15 @@ import type { ItemOnGround } from "../entities/Item";
 
 const DESCENT_HEAL_FLOOR_PERCENT = 0.5;
 
+export type GameMode = "campaign" | "arcade";
+
 export interface Stairs {
   x: number;
   y: number;
 }
 
-// Type renvoyé par runTurns : on indique pour chaque acteur ennemi
-// la séquence des positions intermédiaires qu'il a occupées pendant ce tour.
-// Permet à GameScene de faire des animations séquentielles pour les ennemis
-// rapides (case par case avec pause).
 export interface ActorMovement {
   actor: Actor;
-  // Positions successives (case par case). Le premier élément est la position
-  // de DÉPART, et chaque suivant est une nouvelle case occupée.
-  // Pour speed=1 : 2 entrées max (départ + arrivée).
-  // Pour speed=2 : 3 entrées max (départ + intermédiaire + arrivée).
   positions: { x: number; y: number }[];
 }
 
@@ -30,7 +24,6 @@ export class World {
   public dungeon: Dungeon;
   public fov: FOV;
   public player!: Player;
-  // On utilise MonsterBase pour le typage : Enemy et Crawler en héritent.
   public enemies: MonsterBase[];
   public itemsOnGround: ItemOnGround[];
   public stairs: Stairs | null;
@@ -38,8 +31,13 @@ export class World {
   public gameOver: boolean;
   public currentLevel: number;
   public playerMovedThisTurn: boolean;
+  // Mode de jeu : impacte le spawn du cobalt et la persistance.
+  public gameMode: GameMode;
+  // Cobalt accumulé pendant la run en cours. Sera transféré à la persistance
+  // au moment du retour à la base (ou perdu en cas de mort en arcade).
+  public cobaltCollected: number;
 
-  constructor() {
+  constructor(gameMode: GameMode = "arcade") {
     this.dungeon = new Dungeon();
     this.fov = new FOV(this.dungeon);
     this.enemies = [];
@@ -49,6 +47,8 @@ export class World {
     this.gameOver = false;
     this.currentLevel = 1;
     this.playerMovedThisTurn = false;
+    this.gameMode = gameMode;
+    this.cobaltCollected = 0;
   }
 
   get actors(): Actor[] {
@@ -123,22 +123,22 @@ export class World {
       this.fov.computeWithLantern(
         this.player.x,
         this.player.y,
-        this.player.direction
+        this.player.direction,
+        this.player.darkVisionBonus
       );
     } else {
-      this.fov.computeHaloOnly(this.player.x, this.player.y);
+      this.fov.computeHaloOnly(
+        this.player.x,
+        this.player.y,
+        this.player.direction,      // ← AJOUTER ÇA
+        this.player.darkVisionBonus
+      );
     }
   }
 
-  // Exécute un tour complet. Renvoie la liste des mouvements observés pour
-  // chaque acteur ennemi (utile pour les animations séquentielles côté scène).
-  // Le joueur agit une fois (sa speed est ignorée ici, c'est lui qui rythme).
-  // Les ennemis agissent jusqu'à `speed` fois, dans l'ordre.
   runTurns(): ActorMovement[] {
     if (this.gameOver) return [];
 
-    // Initialiser le tracking des positions pour les ennemis vivants.
-    // On capture la position de départ pour chacun.
     const movements = new Map<Actor, ActorMovement>();
     for (const enemy of this.enemies) {
       if (enemy.isAlive()) {
@@ -149,37 +149,28 @@ export class World {
       }
     }
 
-    // 1. Tour du joueur
     const playerAction = this.player.getAction(this);
     if (playerAction) {
       playerAction.perform(this, this.player);
     } else {
-      // Pas d'action du joueur : on n'avance pas. On retourne vide.
       return [];
     }
 
     if (this.gameOver) return Array.from(movements.values());
 
-    // 2. Tour des ennemis : on fait jusqu'à maxSpeed passes.
-    // À chaque passe, seuls les ennemis dont speed >= passe agissent.
-    const maxSpeed = this.enemies.reduce(
-      (max, e) => Math.max(max, e.speed),
-      1
-    );
+    const maxSpeed = this.enemies.reduce((max, e) => Math.max(max, e.speed), 1);
 
     for (let pass = 1; pass <= maxSpeed; pass++) {
-      // Snapshot des ennemis vivants pour cette passe (peut changer pendant)
       const enemiesThisPass = this.enemies.filter(
         (e) => e.isAlive() && e.speed >= pass
       );
       for (const enemy of enemiesThisPass) {
         if (this.gameOver) return Array.from(movements.values());
-        if (!enemy.isAlive()) continue; // peut avoir été tué pendant la passe
+        if (!enemy.isAlive()) continue;
 
         const action = enemy.getAction(this);
         if (action) {
           action.perform(this, enemy);
-          // Tracker la nouvelle position si elle a changé
           const tracking = movements.get(enemy);
           if (tracking) {
             const last = tracking.positions[tracking.positions.length - 1];
